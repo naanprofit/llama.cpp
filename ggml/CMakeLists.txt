@@ -237,6 +237,7 @@ set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
+option(GGML_RPC_RDMA                        "ggml: enable RDMA transport for RPC (Linux only)" OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
@@ -245,6 +246,15 @@ set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
+
+if (GGML_RPC_RDMA AND WIN32)
+    message(WARNING "GGML_RPC_RDMA is not supported on Windows; disabling")
+    set(GGML_RPC_RDMA OFF)
+endif()
+
+if (GGML_RPC_RDMA AND NOT GGML_RPC)
+    set(GGML_RPC ON)
+endif()
 
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
