@@ -348,15 +348,15 @@ class rpc_transport_listener {
 
     ~rpc_transport_listener() { close_fd(listen_fd, rdma); }
 
-    std::unique_ptr<rpc_transport> accept(std::string & error) {
-        std::unique_ptr<rpc_transport> transport;
+    std::shared_ptr<rpc_transport> accept(std::string & error) {
+        std::shared_ptr<rpc_transport> transport;
 #if !defined(_WIN32) && defined(GGML_RPC_RDMA)
         if (rdma) {
-            transport = std::make_unique<rpc_transport_rdma>();
+            transport = std::make_shared<rpc_transport_rdma>();
         } else
 #endif
         {
-            transport = std::make_unique<rpc_transport_tcp>();
+            transport = std::make_shared<rpc_transport_tcp>();
         }
         if (!transport->accept_and_handshake(listen_fd, error)) {
             transport.reset();
@@ -368,36 +368,6 @@ class rpc_transport_listener {
     rpc_endpoint endpoint;
     sockfd_t     listen_fd;
     bool         rdma = false;
-};
-
-struct rpc_endpoint {
-    std::string scheme;
-    std::string host;
-    int         port = -1;
-
-    bool is_rdma() const { return scheme == "rdma"; }
-
-    std::string str() const {
-        if (!scheme.empty()) {
-            return scheme + "://" + host + ":" + std::to_string(port);
-        }
-        return host + ":" + std::to_string(port);
-    }
-};
-
-struct rpc_transport {
-    virtual ~rpc_transport() = default;
-
-    virtual bool connect(const rpc_endpoint & endpoint, std::string & error)  = 0;
-    virtual bool accept_and_handshake(sockfd_t listener, std::string & error) = 0;
-    virtual bool read_exact(void * buf, size_t n)                             = 0;
-    virtual bool write_exact(const void * buf, size_t n)                      = 0;
-    virtual bool flush()                                                      = 0;
-    virtual void close()                                                      = 0;
-
-    virtual bool is_rdma() const { return false; }
-
-    virtual sockfd_t native_handle() const = 0;
 };
 
 // macro for nicer error messages on server crash
