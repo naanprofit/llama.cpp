@@ -69,6 +69,36 @@ using ssize_t = __int64;
 typedef int sockfd_t;
 #endif
 
+struct rpc_endpoint {
+    std::string scheme;
+    std::string host;
+    int         port = -1;
+
+    bool is_rdma() const { return scheme == "rdma"; }
+
+    std::string str() const {
+        if (!scheme.empty()) {
+            return scheme + "://" + host + ":" + std::to_string(port);
+        }
+        return host + ":" + std::to_string(port);
+    }
+};
+
+struct rpc_transport {
+    virtual ~rpc_transport() = default;
+
+    virtual bool connect(const rpc_endpoint & endpoint, std::string & error)  = 0;
+    virtual bool accept_and_handshake(sockfd_t listener, std::string & error) = 0;
+    virtual bool read_exact(void * buf, size_t n)                             = 0;
+    virtual bool write_exact(const void * buf, size_t n)                      = 0;
+    virtual bool flush()                                                      = 0;
+    virtual void close()                                                      = 0;
+
+    virtual bool is_rdma() const { return false; }
+
+    virtual sockfd_t native_handle() const = 0;
+};
+
 static size_t rdma_chunk_bytes() {
     static size_t value = []() -> size_t {
         const char * env = std::getenv("GGML_RPC_RDMA_BULK_MB");
@@ -79,7 +109,7 @@ static size_t rdma_chunk_bytes() {
         if (parsed == 0) {
             return 256ull * 1024ull * 1024ull;
         }
-        return std::max(parsed * 1024ull * 1024ull, MIN_RDMA_CHUNK);
+        return std::max<size_t>(parsed * 1024ull * 1024ull, MIN_RDMA_CHUNK);
     }();
     return value;
 }
