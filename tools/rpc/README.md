@@ -46,7 +46,7 @@ For example, to build the `rpc-server` with support for CUDA accelerators:
 ```bash
 mkdir build-rpc-cuda
 cd build-rpc-cuda
-cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON
+cmake .. -DGGML_CUDA=ON -DGGML_RPC=ON [-DGGML_RPC_RDMA=ON]
 cmake --build . --config Release
 ```
 
@@ -59,7 +59,7 @@ ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
 ggml_cuda_init: found 1 CUDA devices:
   Device 0: NVIDIA GeForce RTX 5090, compute capability 12.0, VMM: yes
 Starting RPC server v3.0.0
-  endpoint       : 127.0.0.1:50052
+  endpoint       : tcp://127.0.0.1:50052
   local cache    : n/a
 Devices:
   CUDA0: NVIDIA GeForce RTX 5090 (32109 MiB, 31588 MiB free)
@@ -83,6 +83,17 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+### Endpoint selection and security
+
+- Use `tcp://host:port` for the default transport. Leaving off the scheme is treated as TCP for backward compatibility.
+- Use `rdma://host:port` when the project is built with `-DGGML_RPC_RDMA=ON` on Linux and the remote host has rdma-core installed.
+- The `rpc-server` refuses to bind to non-private addresses unless `--allow-public` is provided (or `GGML_RPC_ALLOW_ANY=1` is set). Always prefer loopback or RFC1918 addresses.
+- `rpc-server` also accepts a full `--endpoint` argument to override `--host`/`--port` without changing the bind allowlist.
+
+### RDMA transport
+
+When built with `-DGGML_RPC_RDMA=ON`, the RPC backend can communicate over RDMA using the `rdma://` endpoint scheme. RDMA support is Linux-only and requires rdma-core (`librdmacm` + `libibverbs`) on both client and server hosts. For systems without native RNIC hardware, Soft-RoCE (`rdma_rxe`) can be used for functional testing at the cost of additional CPU overhead. The `--rdma-bulk-mb` flag on `rpc-server` and the `GGML_RPC_RDMA_BULK_MB` environment variable can be used to experiment with pre-registered RDMA buffers.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.
@@ -102,3 +113,16 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc
 $ GGML_RPC_DEBUG=1 bin/rpc-server
 ```
 
+### Roundtrip test utility
+
+The `rpc-roundtrip` utility performs a deterministic SET/GET tensor transfer against a local `rpc-server` instance. It automatically starts a single-connection server (via `GGML_RPC_SINGLE_SHOT=1`) for each endpoint under test:
+
+```bash
+$ ./bin/rpc-roundtrip --tcp tcp://127.0.0.1:50052 --bulk-mb 64
+```
+
+When RDMA is built in, supply an RDMA endpoint to compare bandwidth:
+
+```bash
+$ ./bin/rpc-roundtrip --rdma rdma://127.0.0.1:50053 --bulk-mb 128
+```

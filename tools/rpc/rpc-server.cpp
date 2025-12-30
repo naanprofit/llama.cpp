@@ -1,28 +1,33 @@
 #if defined(_MSC_VER)
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+#    define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
 
 #include "ggml-rpc.h"
 #ifdef _WIN32
-#  define NOMINMAX
-#  define DIRECTORY_SEPARATOR '\\'
-#  include <locale>
-#  include <windows.h>
-#  include <fcntl.h>
-#  include <io.h>
+#    define NOMINMAX
+#    define DIRECTORY_SEPARATOR '\\'
+#    include <fcntl.h>
+#    include <io.h>
+#    include <windows.h>
+#    include <ws2tcpip.h>
+
+#    include <locale>
 #else
-#  define DIRECTORY_SEPARATOR '/'
-#  include <unistd.h>
-#  include <sys/stat.h>
+#    define DIRECTORY_SEPARATOR '/'
+#    include <arpa/inet.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
 #endif
-#include <codecvt>
-#include <string>
 #include <stdio.h>
-#include <vector>
-#include <filesystem>
+
 #include <algorithm>
-#include <thread>
+#include <codecvt>
+#include <cstdlib>
+#include <filesystem>
 #include <regex>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +36,7 @@ namespace fs = std::filesystem;
 static bool fs_create_directory_with_parents(const std::string & path) {
 #ifdef _WIN32
     std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-    std::wstring wpath = converter.from_bytes(path);
+    std::wstring                                     wpath = converter.from_bytes(path);
 
     // if the path already exists, check whether it's a directory
     const DWORD attributes = GetFileAttributesW(wpath.c_str());
@@ -44,7 +49,7 @@ static bool fs_create_directory_with_parents(const std::string & path) {
     // process path from front to back, procedurally creating directories
     while ((pos_slash = path.find('\\', pos_slash)) != std::string::npos) {
         const std::wstring subpath = wpath.substr(0, pos_slash);
-        const wchar_t * test = subpath.c_str();
+        const wchar_t *    test    = subpath.c_str();
 
         const bool success = CreateDirectoryW(test, NULL);
         if (!success) {
@@ -72,12 +77,12 @@ static bool fs_create_directory_with_parents(const std::string & path) {
         return S_ISDIR(info.st_mode);
     }
 
-    size_t pos_slash = 1; // skip leading slashes for directory creation
+    size_t pos_slash = 1;  // skip leading slashes for directory creation
 
     // process path from front to back, procedurally creating directories
     while ((pos_slash = path.find('/', pos_slash)) != std::string::npos) {
         const std::string subpath = path.substr(0, pos_slash);
-        struct stat info;
+        struct stat       info;
 
         // if the path already exists, ensure that it's a directory
         if (stat(subpath.c_str(), &info) == 0) {
@@ -96,13 +101,13 @@ static bool fs_create_directory_with_parents(const std::string & path) {
     }
 
     return true;
-#endif // _WIN32
+#endif  // _WIN32
 }
 
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
 static std::string fs_get_cache_directory() {
-    std::string cache_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
+    std::string cache_directory       = "";
+    auto        ensure_trailing_slash = [](std::string p) {
         // Make sure to add trailing slash
         if (p.back() != DIRECTORY_SEPARATOR) {
             p += DIRECTORY_SEPARATOR;
@@ -123,7 +128,7 @@ static std::string fs_get_cache_directory() {
 #elif defined(_WIN32)
         cache_directory = std::getenv("LOCALAPPDATA");
 #else
-#  error Unknown architecture
+#    error Unknown architecture
 #endif
         cache_directory = ensure_trailing_slash(cache_directory);
         cache_directory += "llama.cpp";
@@ -131,23 +136,79 @@ static std::string fs_get_cache_directory() {
     return ensure_trailing_slash(cache_directory);
 }
 
+static bool is_private_ipv4(const std::string & host) {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
+        return false;
+    }
+    const uint32_t ip = ntohl(addr.s_addr);
+    return (ip >> 24 == 10) || ((ip & 0xfff00000u) == 0xac100000u) || (ip >> 16 == ((192 << 8) | 168)) ||
+           (ip >> 16 == ((169 << 8) | 254)) || (ip >> 24 == 127);
+}
+
+static bool is_private_host(const std::string & host) {
+    if (host == "localhost") {
+        return true;
+    }
+    return is_private_ipv4(host);
+}
+
+static bool parse_endpoint(const std::string & endpoint, std::string & scheme, std::string & host, int & port) {
+    std::string working    = endpoint;
+    size_t      scheme_pos = working.find("://");
+    if (scheme_pos != std::string::npos) {
+        scheme  = working.substr(0, scheme_pos);
+        working = working.substr(scheme_pos + 3);
+    } else {
+        scheme = "tcp";
+    }
+    size_t colon_pos = working.rfind(':');
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+    host = working.substr(0, colon_pos);
+    try {
+        port = std::stoi(working.substr(colon_pos + 1));
+    } catch (const std::exception &) {
+        return false;
+    }
+    return port > 0 && port <= 65535 && !scheme.empty();
+}
+
+static void set_env_flag(const char * name, const std::string & value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
+}
+
 struct rpc_server_params {
-    std::string              host        = "127.0.0.1";
-    int                      port        = 50052;
-    bool                     use_cache   = false;
-    int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    std::string              host = "127.0.0.1";
+    int                      port = 50052;
+    std::string              endpoint;
+    bool                     use_cache = false;
+    int                      n_threads = std::max(1U, std::thread::hardware_concurrency() / 2);
     std::vector<std::string> devices;
+    size_t                   rdma_bulk_mb = 256;
+    bool                     allow_public = false;
 };
 
 static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "Usage: %s [options]\n\n", argv[0]);
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
-    fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
+    fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n",
+            params.n_threads);
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+    fprintf(stderr, "      --endpoint ENDPOINT          override host/port with tcp:// or rdma:// endpoint\n");
+    fprintf(stderr, "      --rdma-bulk-mb N             RDMA bulk ring size in MiB (default: %zu)\n",
+            params.rdma_bulk_mb);
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr,
+            "      --allow-public               allow binding to non-private addresses (default: private only)\n");
     fprintf(stderr, "\n");
 }
 
@@ -160,6 +221,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.host = argv[i];
+        } else if (arg == "--endpoint") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.endpoint = argv[i];
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 return false;
@@ -173,14 +239,14 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             if (++i >= argc) {
                 return false;
             }
-            const std::regex regex{ R"([,/]+)" };
-            std::string dev_str = argv[i];
+            const std::regex           regex{ R"([,/]+)" };
+            std::string                dev_str = argv[i];
             std::sregex_token_iterator iter(dev_str.begin(), dev_str.end(), regex, -1);
             std::sregex_token_iterator end;
-            for ( ; iter != end; ++iter) {
+            for (; iter != end; ++iter) {
                 try {
                     params.devices.push_back(*iter);
-                } catch (const std::exception & ) {
+                } catch (const std::exception &) {
                     fprintf(stderr, "error: invalid device: %s\n", iter->str().c_str());
                     return false;
                 }
@@ -193,8 +259,15 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             if (params.port <= 0 || params.port > 65535) {
                 return false;
             }
+        } else if (arg == "--rdma-bulk-mb") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.rdma_bulk_mb = static_cast<size_t>(std::stoul(argv[i]));
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "--allow-public") {
+            params.allow_public = true;
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -221,7 +294,8 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
                     auto * dev = ggml_backend_dev_get(i);
                     size_t free, total;
                     ggml_backend_dev_memory(dev, &free, &total);
-                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+                    printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev),
+                           ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
                 }
                 return {};
             }
@@ -258,24 +332,41 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    if (params.host != "127.0.0.1") {
-        fprintf(stderr, "\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
-        fprintf(stderr, "         Never expose the RPC server to an open network!\n");
-        fprintf(stderr, "         This is an experimental feature and is not secure!\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "\n");
+    std::string endpoint = params.endpoint.empty() ? params.host + ":" + std::to_string(params.port) : params.endpoint;
+    std::string scheme;
+    std::string host;
+    int         port = 0;
+    if (!parse_endpoint(endpoint, scheme, host, port)) {
+        fprintf(stderr, "Invalid endpoint: %s\n", endpoint.c_str());
+        return 1;
     }
+    if (scheme != "tcp" && scheme != "rdma") {
+        fprintf(stderr, "Unsupported endpoint scheme: %s\n", scheme.c_str());
+        return 1;
+    }
+#ifndef GGML_RPC_RDMA
+    if (scheme == "rdma") {
+        fprintf(stderr, "RDMA endpoint requested but GGML_RPC_RDMA is not enabled in this build\n");
+        return 1;
+    }
+#endif
+    if (!params.allow_public && !is_private_host(host)) {
+        fprintf(stderr, "Refusing to bind to non-private address %s (use --allow-public to override)\n", host.c_str());
+        return 1;
+    }
+    if (params.allow_public) {
+        set_env_flag("GGML_RPC_ALLOW_ANY", "1");
+    }
+    set_env_flag("GGML_RPC_RDMA_BULK_MB", std::to_string(params.rdma_bulk_mb));
+    endpoint = scheme + "://" + host + ":" + std::to_string(port);
 
     auto devices = get_devices(params);
     if (devices.empty()) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-    std::string endpoint = params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
-    std::string cache_dir_str;
+    std::string  cache_dir_str;
     if (params.use_cache) {
         cache_dir_str = fs_get_cache_directory() + "rpc/";
         if (!fs_create_directory_with_parents(cache_dir_str)) {
@@ -291,7 +382,8 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    auto start_server_fn = (decltype(ggml_backend_rpc_start_server)*) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_start_server");
+    auto start_server_fn = (decltype(ggml_backend_rpc_start_server) *) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_rpc_start_server");
     if (!start_server_fn) {
         fprintf(stderr, "Failed to obtain RPC backend start server function\n");
         return 1;
